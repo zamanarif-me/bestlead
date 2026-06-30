@@ -144,9 +144,13 @@ with tab_run:
         try:
             client = OutscraperClient(api_key=api_key)
             locations = collect_locations(uploaded, locations_text)
+            # Full enrichment is handled by enrichment.enrich_leads() via the
+            # /emails-and-contacts crawl (which also returns socials). Do NOT also
+            # turn on the search-side `extract_contacts` enrichment, or Outscraper
+            # crawls — and bills for — the SAME domains twice. Keep the search lean.
             cfg = ScrapeConfig(niche=niche, locations=locations, limit_per_query=limit,
                                language=language, region=region or None,
-                               drop_duplicates=drop_dupes_api, extract_contacts=(enrich_mode == "Full"))
+                               drop_duplicates=drop_dupes_api, extract_contacts=False)
             meta = {"niche": niche, "locations": locations, "mode": enrich_mode, "run_mode": run_mode}
 
             if run_mode == "Sync":
@@ -276,6 +280,9 @@ with tab_export:
 
     st.divider()
     st.subheader("🗂️ Session history")
+    st.caption("⚠️ History & cross-session dedup live on local disk (./data). On "
+               "ephemeral hosts (Streamlit Cloud, most containers) this resets on "
+               "every restart — see README → Deployment for persistent storage.")
     sessions = history.list_sessions()
     if not sessions:
         st.caption("No past sessions yet.")

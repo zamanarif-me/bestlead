@@ -85,7 +85,11 @@ def _norm_phone(phone: str | None) -> str:
 def _norm_name(text: str | None) -> str:
     if not text:
         return ""
-    words = re.sub(r"[^a-z0-9 ]", " ", str(text).lower()).split()
+    # Drop apostrophes first so "Joe's" collapses to "joes" (not "joe s") and
+    # matches a listing written as "Joes". Then turn other punctuation into
+    # token breaks.
+    lowered = str(text).lower().replace("'", "").replace("’", "")
+    words = re.sub(r"[^a-z0-9 ]", " ", lowered).split()
     words = [w for w in words if w not in _SUFFIXES]
     return " ".join(words)
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from datetime import datetime
 
 from .dedup import identity_keys
@@ -30,6 +31,34 @@ INDEX_FILE = os.path.join(HISTORY_DIR, "_seen_index.json")
 def _ensure_dirs() -> None:
     os.makedirs(HISTORY_DIR, exist_ok=True)
     os.makedirs(EXPORTS_DIR, exist_ok=True)
+
+
+def _atomic_write_bytes(path: str, data: bytes) -> None:
+    """Write to a temp file in the same dir, then os.replace() into place.
+
+    os.replace() is atomic on a single volume, so a crash or interrupt mid-write
+    can never leave a half-written file. Critical for _seen_index.json: a
+    truncated index is silently swallowed by load_seen_index() and would wipe
+    all cross-session dedup memory.
+    """
+    d = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp_", suffix=".part")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _atomic_write_text(path: str, text: str) -> None:
+    _atomic_write_bytes(path, text.encode("utf-8"))
 
 
 # ─────────────── seen index ───────────────
@@ -72,17 +101,16 @@ def save_session(leads: list[dict], meta: dict | None = None) -> dict:
                 index[k] = session_id
                 added += 1
 
-    with open(INDEX_FILE, "w", encoding="utf-8") as f:
-        json.dump(index, f)
-
     csv_path = os.path.join(HISTORY_DIR, f"{session_id}.csv")
-    with open(csv_path, "wb") as f:
-        f.write(to_full_csv(leads))
+    _atomic_write_bytes(csv_path, to_full_csv(leads))
 
     meta = dict(meta or {})
     meta.update({"rows": len(leads), "new_keys": added, "saved_at": datetime.now().isoformat()})
-    with open(os.path.join(HISTORY_DIR, f"{session_id}.meta.json"), "w", encoding="utf-8") as f:
-        json.dump(meta, f)
+    _atomic_write_text(os.path.join(HISTORY_DIR, f"{session_id}.meta.json"), json.dumps(meta))
+
+    # Write the index LAST and atomically: the session snapshot is on disk before
+    # we commit its keys, so a crash never leaves keys pointing at a missing CSV.
+    _atomic_write_text(INDEX_FILE, json.dumps(index))
 
     return {"session_id": session_id, "path": csv_path, "new_keys": added, "rows": len(leads)}
 

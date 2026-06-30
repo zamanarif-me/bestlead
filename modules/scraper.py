@@ -129,29 +129,71 @@ class OutscraperClient:
 
     # -- low-level HTTP ------------------------------------------------
 
-    def _get(self, endpoint: str, params: list[tuple]) -> dict:
-        url = f"{self.BASE_URL}{endpoint}"
-        try:
-            resp = self.session.get(url, params=params, timeout=self.timeout)
-        except requests.RequestException as e:
-            raise OutscraperError(f"Network error calling {endpoint}: {e}") from e
+    # Transient statuses worth retrying: rate-limit + the gateway/proxy family
+    # Outscraper's nginx returns when a job runs long (502/503/504).
+    RETRY_STATUSES = (429, 502, 503, 504)
 
-        if resp.status_code == 401:
-            raise OutscraperError("Unauthorized (401) — check your API key.")
-        if resp.status_code == 402:
-            raise OutscraperError("Payment required (402) — out of Outscraper credits.")
-        if resp.status_code not in (200, 202):
-            raise OutscraperError(f"{endpoint} returned {resp.status_code}: {resp.text[:300]}")
-        try:
-            return resp.json()
-        except ValueError as e:
-            raise OutscraperError(f"{endpoint} returned non-JSON: {resp.text[:300]}") from e
+    def _get(self, endpoint: str, params: list[tuple], max_retries: int = 4) -> dict:
+        url = f"{self.BASE_URL}{endpoint}"
+        backoff = 2.0
+        resp = None
+        for attempt in range(max_retries + 1):
+            try:
+                resp = self.session.get(url, params=params, timeout=self.timeout)
+            except requests.RequestException as e:
+                if attempt < max_retries:
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
+                raise OutscraperError(f"Network error calling {endpoint}: {e}") from e
+
+            if resp.status_code == 401:
+                raise OutscraperError("Unauthorized (401) — check your API key.")
+            if resp.status_code == 402:
+                raise OutscraperError("Payment required (402) — out of Outscraper credits.")
+
+            # Back off on rate-limit / gateway timeouts and try again.
+            if resp.status_code in self.RETRY_STATUSES and attempt < max_retries:
+                time.sleep(self._retry_after(resp, backoff))
+                backoff *= 2
+                continue
+
+            if resp.status_code not in (200, 202):
+                raise OutscraperError(f"{endpoint} returned {resp.status_code}: {resp.text[:300]}")
+            try:
+                return resp.json()
+            except ValueError as e:
+                raise OutscraperError(f"{endpoint} returned non-JSON: {resp.text[:300]}") from e
+
+        # Exhausted retries on a retryable status.
+        code = resp.status_code if resp is not None else "?"
+        raise OutscraperError(
+            f"{endpoint} still failing after {max_retries} retries (last status {code})."
+        )
+
+    @staticmethod
+    def _retry_after(resp, fallback: float) -> float:
+        """Honor a Retry-After header (seconds) if present, capped; else fallback."""
+        header = resp.headers.get("Retry-After")
+        if header:
+            try:
+                return min(float(header), 60.0)
+            except ValueError:
+                pass
+        return fallback
 
     def _get_with_polling(self, endpoint: str, params: list[tuple],
                           poll_interval: int = 5, max_wait: int | None = 600) -> list:
-        """Submit synchronously; if the API parks it as a job, poll until done."""
-        body = self._get(endpoint, params + [("async", "false")])
-        if body.get("status") == "Success":
+        """Submit as a background job and poll until done.
+
+        We always submit ``async=true`` so we never hold a long synchronous
+        connection through Outscraper's gateway. Heavy jobs (Full enrichment,
+        large limits, dense cities) otherwise trip its ~60s proxy timeout and
+        come back as an nginx ``504 Gateway Time-out`` before any data is ready.
+        Small jobs may still answer inline, which we return immediately.
+        """
+        body = self._get(endpoint, params + [("async", "true")])
+        if body.get("status") == "Success" and "data" in body:
             return body.get("data", [])
 
         request_id = body.get("id")
