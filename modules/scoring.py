@@ -1,24 +1,34 @@
-"""Lead scoring for outreach prioritization.
+"""Lead scoring for outreach prioritization (Digital Zeon weights).
 
-The scoring is tuned for selling services (web design / SEO / marketing):
-a business with NO website and FEW reviews is a *hot* opportunity, not a
-low-quality record. Tweak the weights in `DEFAULT_WEIGHTS` to fit your offer.
+Tuned for selling services to home-service businesses: a business with NO
+website and few reviews is a *hot* opportunity, not a low-quality record.
+
+Point system (only signals we can actually compute from Outscraper data):
+    No website ............... +40
+    Reviews < 10 ............. +15
+    Rating < 3.5 ............. +10
+    No GBP photos ............ +10
+    No usable email .......... -10   (penalty — harder to reach by email)
+
+Labels:  🔥 Hot 60+   ✅ Warm 35-59   💤 Cold <35
+
+NOTE: "Website but mobile-unfriendly +25" from the spec is intentionally left
+out — that signal needs a separate API (e.g. Google PageSpeed) and isn't in the
+Maps data. Hook is left below if you want to add it later.
 """
 
 from __future__ import annotations
 
 DEFAULT_WEIGHTS = {
-    "no_website": 35,        # biggest buying signal for web/marketing services
-    "no_reviews": 20,
-    "few_reviews": 12,       # < 10 reviews
-    "low_rating": 10,        # rating < 4.0
-    "unverified": 8,         # unclaimed Google listing
-    "has_phone": 10,         # reachable by call
-    "has_email": 8,          # reachable by email
-    "direct_email": 12,      # decision-maker reachable directly
+    "no_website": 40,
+    "few_reviews": 15,    # < 10 reviews
+    "low_rating": 10,     # < 3.5
+    "no_photos": 10,      # no Google Business Profile photos
+    "no_email": -10,      # penalty when no usable email is found
+    # "mobile_unfriendly": 25,  # needs PageSpeed API — not wired yet
 }
 
-HOT, WARM = 70, 40
+HOT, WARM = 60, 35
 
 
 def score_lead(lead: dict, weights: dict | None = None) -> dict:
@@ -30,33 +40,25 @@ def score_lead(lead: dict, weights: dict | None = None) -> dict:
         score += w["no_website"]
         reasons.append("No website")
 
-    reviews = _to_int(lead.get("reviews"))
-    if reviews == 0:
-        score += w["no_reviews"]
-        reasons.append("No reviews")
-    elif reviews < 10:
+    reviews = lead.get("reviews")
+    if reviews is not None and _to_int(reviews) < 10:
         score += w["few_reviews"]
         reasons.append("Few reviews (<10)")
 
     rating = _to_float(lead.get("rating"))
-    if rating is not None and rating < 4.0:
+    if rating is not None and rating < 3.5:
         score += w["low_rating"]
         reasons.append(f"Low rating ({rating})")
 
-    if lead.get("verified") is False:
-        score += w["unverified"]
-        reasons.append("Unverified listing")
+    photos = lead.get("photos_count")
+    if photos is not None and _to_int(photos) == 0:
+        score += w["no_photos"]
+        reasons.append("No photos")
 
-    if lead.get("phone"):
-        score += w["has_phone"]
-        reasons.append("Has phone")
-
-    if lead.get("email_best") and lead.get("email_status") != "Dead":
-        score += w["has_email"]
-        reasons.append("Has email")
-        if lead.get("email_best_type") == "Direct":
-            score += w["direct_email"]
-            reasons.append("Direct email")
+    has_email = bool(lead.get("email_best")) and lead.get("email_status") != "Dead"
+    if not has_email:
+        score += w["no_email"]
+        reasons.append("No usable email (-)")
 
     score = max(0, min(score, 100))
     lead["lead_score"] = score

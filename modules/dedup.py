@@ -1,33 +1,65 @@
 """Duplicate detection.
 
-Across multiple locations/queries the same business can appear more than once.
-We collapse on the strongest available identity key, in order:
-
-    1. place_id          (Google's own unique id — most reliable)
+A lead is a duplicate if ANY of its identity keys was already seen:
+    1. place_id          (Google's own unique id)
     2. normalized phone
-    3. normalized name + address
+    3. any email
+    4. normalized business-name + city   (light fuzzy: suffixes/punct stripped)
 
-The first occurrence is kept as the "primary"; later ones are flagged
-`is_duplicate=True` so the UI/exporter can drop or review them.
+`identity_keys` is reused by `history.py` for cross-session dedup, so in-session
+and across-session matching use exactly the same logic.
 """
 
 from __future__ import annotations
 
 import re
 
+# Words dropped when normalizing a business name so "Joe's Plumbing LLC" and
+# "Joe's Plumbing" collapse together.
+_SUFFIXES = {"llc", "inc", "ltd", "co", "corp", "company", "the", "and", "&"}
+
+
+def identity_keys(lead: dict) -> list[str]:
+    """All string keys that identify this lead. Used for dedup + history."""
+    keys: list[str] = []
+
+    pid = lead.get("place_id")
+    if pid:
+        keys.append(f"pid:{pid}")
+
+    phone = _norm_phone(lead.get("phone"))
+    if phone:
+        keys.append(f"phone:{phone}")
+
+    for email in lead.get("emails", []) or []:
+        email = (email or "").strip().lower()
+        if email:
+            keys.append(f"email:{email}")
+
+    name = _norm_name(lead.get("name"))
+    if name:
+        city = _norm_text(lead.get("city"))
+        keys.append(f"name:{name}|{city}")
+
+    return keys
+
 
 def deduplicate(leads: list[dict]) -> list[dict]:
     """Annotate each lead with `is_duplicate` / `duplicate_of`. Returns same list."""
-    seen: dict[tuple, str] = {}
+    seen: dict[str, str] = {}
     for idx, lead in enumerate(leads):
-        key = _dedup_key(lead, idx)
-        if key in seen:
+        keys = identity_keys(lead)
+        match = next((seen[k] for k in keys if k in seen), None)
+
+        if match is not None:
             lead["is_duplicate"] = True
-            lead["duplicate_of"] = seen[key]
+            lead["duplicate_of"] = match
         else:
             lead["is_duplicate"] = False
-            lead["duplicate_of"] = None
-            seen[key] = lead.get("name") or f"row {idx}"
+            lead.setdefault("duplicate_of", None)
+            label = lead.get("name") or f"row {idx}"
+            for k in keys:
+                seen.setdefault(k, label)
     return leads
 
 
@@ -39,34 +71,23 @@ def duplicate_count(leads: list[dict]) -> int:
     return sum(1 for l in leads if l.get("is_duplicate"))
 
 
-# ─────────────── internals ───────────────
-
-def _dedup_key(lead: dict, idx: int) -> tuple:
-    place_id = lead.get("place_id")
-    if place_id:
-        return ("pid", str(place_id))
-
-    phone = _norm_phone(lead.get("phone"))
-    if phone:
-        return ("phone", phone)
-
-    name = _norm_text(lead.get("name"))
-    addr = _norm_text(lead.get("full_address"))
-    if name:
-        return ("name_addr", name, addr)
-
-    # Nothing to key on — treat as unique.
-    return ("row", idx)
-
+# ─────────────── normalizers ───────────────
 
 def _norm_phone(phone: str | None) -> str:
     if not phone:
         return ""
     digits = re.sub(r"\D", "", str(phone))
-    # Drop a leading country '1' for US-style numbers so +1 and bare match.
-    if len(digits) == 11 and digits.startswith("1"):
+    if len(digits) == 11 and digits.startswith("1"):  # strip US country code
         digits = digits[1:]
     return digits
+
+
+def _norm_name(text: str | None) -> str:
+    if not text:
+        return ""
+    words = re.sub(r"[^a-z0-9 ]", " ", str(text).lower()).split()
+    words = [w for w in words if w not in _SUFFIXES]
+    return " ".join(words)
 
 
 def _norm_text(text: str | None) -> str:

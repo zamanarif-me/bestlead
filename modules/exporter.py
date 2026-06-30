@@ -1,9 +1,15 @@
 """Export leads to ready-to-use CSVs.
 
-Two deliverables:
-  - Instantly CSV : cold-email upload (email, first/last name, company, custom vars).
-                    Only rows with a usable, non-dead email are included.
-  - Call list CSV : phone outreach, sorted by lead score, only rows with a phone.
+  - Instantly CSV : cold-email upload. Only rows with a usable, non-dead email.
+                    First/Last, Email, Business, Phone, Website, City, State,
+                    Score, Email Type, Icebreaker, Facebook, Instagram.
+  - Call list CSV : phone outreach, sorted by score, rows with a phone.
+                    Business, Phone, City, Score, Has Website, Review Count,
+                    Facebook, Notes.
+  - Full CSV      : everything, for your own records / re-import.
+
+Rows that are in-batch duplicates OR already seen in a past session are skipped
+from the outreach CSVs.
 """
 
 from __future__ import annotations
@@ -12,70 +18,77 @@ import io
 
 import pandas as pd
 
-# Email statuses safe to load into an email-sending tool.
-SENDABLE_STATUSES = {"Valid", "Risky"}
+INSTANTLY_COLUMNS = [
+    "First Name", "Last Name", "Email", "Business Name", "Phone", "Website",
+    "City", "State", "Score", "Email Type", "Icebreaker", "Facebook", "Instagram",
+]
+
+CALL_LIST_COLUMNS = [
+    "Business Name", "Phone", "City", "Score", "Has Website",
+    "Review Count", "Facebook", "Notes",
+]
+
+
+def _exportable(lead: dict) -> bool:
+    return not (lead.get("is_duplicate") or lead.get("seen_before"))
 
 
 def to_instantly_csv(leads: list[dict], include_risky: bool = True) -> bytes:
     allowed = {"Valid"} | ({"Risky"} if include_risky else set())
     rows = []
     for lead in leads:
-        if lead.get("is_duplicate"):
+        if not _exportable(lead):
             continue
         email = lead.get("email_best")
         if not email or lead.get("email_status") not in allowed:
             continue
 
         first, last = _split_name(_contact_name(lead, email))
+        socials = lead.get("socials") or {}
         rows.append({
-            "email": email,
-            "first_name": first,
-            "last_name": last,
-            "company_name": lead.get("name") or "",
-            "website": lead.get("website") or "",
-            "phone": lead.get("phone") or "",
-            "city": lead.get("city") or "",
-            "state": lead.get("state") or "",
-            "email_type": lead.get("email_best_type") or "",
-            "lead_score": lead.get("lead_score", 0),
-            "lead_label": lead.get("lead_label", ""),
+            "First Name": first,
+            "Last Name": last,
+            "Email": email,
+            "Business Name": lead.get("name") or "",
+            "Phone": lead.get("phone") or "",
+            "Website": lead.get("website") or "",
+            "City": lead.get("city") or "",
+            "State": lead.get("state") or "",
+            "Score": lead.get("lead_score", 0),
+            "Email Type": lead.get("email_best_type") or "",
+            "Icebreaker": lead.get("icebreaker") or "",
+            "Facebook": socials.get("facebook", ""),
+            "Instagram": socials.get("instagram", ""),
         })
-    return _df_to_csv(rows, columns=[
-        "email", "first_name", "last_name", "company_name", "website",
-        "phone", "city", "state", "email_type", "lead_score", "lead_label",
-    ])
+    rows.sort(key=lambda r: r["Score"], reverse=True)
+    return _df_to_csv(rows, INSTANTLY_COLUMNS)
 
 
 def to_call_list_csv(leads: list[dict]) -> bytes:
     rows = []
     for lead in leads:
-        if lead.get("is_duplicate") or not lead.get("phone"):
+        if not _exportable(lead) or not lead.get("phone"):
             continue
+        socials = lead.get("socials") or {}
         rows.append({
-            "company_name": lead.get("name") or "",
-            "phone": lead.get("phone") or "",
-            "website": lead.get("website") or "",
-            "address": lead.get("full_address") or "",
-            "city": lead.get("city") or "",
-            "rating": lead.get("rating") or "",
-            "reviews": lead.get("reviews") or "",
-            "lead_score": lead.get("lead_score", 0),
-            "lead_label": lead.get("lead_label", ""),
-            "why": lead.get("score_reasons") or "",
-            "google_maps_url": lead.get("google_maps_url") or "",
+            "Business Name": lead.get("name") or "",
+            "Phone": lead.get("phone") or "",
+            "City": lead.get("city") or "",
+            "Score": lead.get("lead_score", 0),
+            "Has Website": "Yes" if lead.get("website") else "No",
+            "Review Count": lead.get("reviews") or 0,
+            "Facebook": socials.get("facebook", ""),
+            "Notes": lead.get("score_reasons") or "",
         })
-    rows.sort(key=lambda r: r["lead_score"], reverse=True)
-    return _df_to_csv(rows, columns=[
-        "company_name", "phone", "website", "address", "city", "rating",
-        "reviews", "lead_score", "lead_label", "why", "google_maps_url",
-    ])
+    rows.sort(key=lambda r: r["Score"], reverse=True)
+    return _df_to_csv(rows, CALL_LIST_COLUMNS)
 
 
 def to_full_csv(leads: list[dict]) -> bytes:
-    """Everything, for your own records / re-import."""
     rows = []
     for lead in leads:
-        row = {k: v for k, v in lead.items() if not k.startswith("_") and k not in ("email_details", "email_contacts", "socials")}
+        skip = ("email_details", "email_contacts", "socials")
+        row = {k: v for k, v in lead.items() if not k.startswith("_") and k not in skip}
         row["emails"] = ", ".join(lead.get("emails", []))
         row["socials"] = ", ".join(f"{k}:{v}" for k, v in (lead.get("socials") or {}).items())
         rows.append(row)

@@ -225,6 +225,7 @@ def normalize_lead(raw: dict) -> dict:
         "country": raw.get("country"),
         "rating": raw.get("rating"),
         "reviews": raw.get("reviews"),
+        "photos_count": raw.get("photos_count"),
         "category": raw.get("type") or raw.get("category") or raw.get("subtypes"),
         "working_hours": _format_hours(raw.get("working_hours")),
         "latitude": raw.get("latitude"),
