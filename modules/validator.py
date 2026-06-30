@@ -52,30 +52,55 @@ class EmailValidator:
 
     # ─────────────── public API ───────────────
 
-    def validate_leads(self, leads: list[dict], progress=None) -> list[dict]:
-        """Validate every email on every lead, then pick the best one."""
+    def validate_leads(self, leads: list[dict], progress=None, cache=None) -> list[dict]:
+        """Validate every email on every lead, then pick the best one.
+
+        `cache` (optional) is a checkpoint.JsonCache of {email: result}. Emails
+        already in it are reused — so after a wifi drop / restart the resumed run
+        skips everything already done and never re-charges the paid L4 validator.
+        Only confident results are cached (see `_cacheable`); a "Dead" caused by a
+        DNS/SMTP/API blip is NOT cached, so it is safely re-checked on resume.
+        """
         all_emails = sorted({e.lower() for lead in leads for e in lead.get("emails", [])})
 
         results: dict[str, dict] = {}
         total = len(all_emails)
-        done = 0
+
+        # Seed from cache; only the rest needs (re)validation.
+        todo = []
+        for email in all_emails:
+            if cache is not None and email in cache:
+                results[email] = cache.get(email)
+            else:
+                todo.append(email)
+        done = len(results)
+        if progress:
+            progress(done, total)
+
+        def record(email: str, res: dict) -> None:
+            results[email] = res
+            if cache is not None and _cacheable(res):
+                cache.put(email, res)
 
         # SMTP is I/O-bound -> thread it. Syntax/MX/API-only stays light.
-        if "smtp" in self.levels and total:
+        if "smtp" in self.levels and todo:
             with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
-                futures = {pool.submit(self.validate_email, e): e for e in all_emails}
+                futures = {pool.submit(self.validate_email, e): e for e in todo}
                 for fut in as_completed(futures):
                     email = futures[fut]
-                    results[email] = fut.result()
+                    record(email, fut.result())
                     done += 1
                     if progress:
                         progress(done, total)
         else:
-            for email in all_emails:
-                results[email] = self.validate_email(email)
+            for email in todo:
+                record(email, self.validate_email(email))
                 done += 1
                 if progress:
                     progress(done, total)
+
+        if cache is not None:
+            cache.flush()
 
         for lead in leads:
             details = [results[e.lower()] for e in lead.get("emails", []) if e.lower() in results]
@@ -183,6 +208,22 @@ class EmailValidator:
 
 
 # ─────────────── helpers ───────────────
+
+def _cacheable(res: dict) -> bool:
+    """Only persist confident verdicts to the resume cache.
+
+    Valid/Risky are safe to remember. A syntax-failure Dead is deterministic, so
+    cache it too. But a Dead/None from MX/SMTP/API could be a transient network
+    failure (the very thing we're guarding against) — never cache that, so it is
+    re-checked cleanly on the next run.
+    """
+    status = res.get("status")
+    if status in ("Valid", "Risky"):
+        return True
+    if status == "Dead" and res.get("syntax") is False:
+        return True
+    return False
+
 
 def classify_type(email: str) -> str:
     local, _, domain = email.partition("@")

@@ -10,10 +10,10 @@ testable.
 """
 
 from . import (  # noqa: F401
-    scraper, enrichment, validator, scoring, icebreaker, dedup, history, exporter,
+    scraper, enrichment, validator, scoring, icebreaker, dedup, history, checkpoint, exporter,
 )
 
 __all__ = [
     "scraper", "enrichment", "validator", "scoring",
-    "icebreaker", "dedup", "history", "exporter",
+    "icebreaker", "dedup", "history", "checkpoint", "exporter",
 ]

@@ -19,10 +19,19 @@ scores them for outreach, removes duplicates, and exports ready-to-use CSVs.
 ```bash
 pip install -r requirements.txt
 ```
-Edit `.env` and set your key:
-```
-OUTSCRAPER_API_KEY=sk_...
-```
+Provide your Outscraper key one of three ways (checked in this order):
+
+1. **Streamlit Secrets** (recommended for Streamlit Cloud) — Manage app →
+   Settings → Secrets, paste:
+   ```toml
+   OUTSCRAPER_API_KEY = "sk_..."
+   ```
+   Locally, copy `.streamlit/secrets.toml.example` → `.streamlit/secrets.toml`.
+2. **`.env`** (copy `.env.example` → `.env`):
+   ```
+   OUTSCRAPER_API_KEY=sk_...
+   ```
+3. **Paste it in the sidebar** at runtime (overrides the above).
 
 ## Run
 ```bash
@@ -39,6 +48,7 @@ modules/
   scoring.py            # Lead scoring (weights tunable)
   dedup.py              # Duplicate detection
   history.py            # Persistent session history + cross-session dedup
+  checkpoint.py         # Crash/disconnect resume: job handle + per-key caches
   icebreaker.py         # Template cold-email first lines
   exporter.py           # Instantly / Call-list / Full CSV export
 tests/                  # Network-free unit tests (pytest)
@@ -59,6 +69,29 @@ requirements-dev.txt    # adds pytest
   background request and polls for the result, so heavy jobs (Full enrichment,
   large limits, dense cities) don't trip the gateway's ~60s `504` timeout. Use
   **Async** for very large batches so the UI stays responsive.
+
+## Resilience / resume (network drops mid-run)
+A run is checkpointed so a wifi drop, browser refresh, or app restart doesn't
+cost you the run or re-charge you for work already done:
+
+1. **Job handle** — when an Async job is submitted, its `request_id` + settings
+   are saved to `data/jobs/active.json`. After a refresh, the **🔁 Resume this
+   job** panel restores it so you can keep polling instead of losing the job.
+2. **Scraped leads** — saved to the same job file *before* any paid enrichment/
+   validation, so the leads are never lost once scraped.
+3. **Per-key caches** — `data/cache/validation.json` (`{email: result}`) and
+   `data/cache/enrichment.json` (`{domain: record}`) are written incrementally as
+   work completes. On **▶️ Resume processing**, already-validated emails and
+   already-crawled domains are **skipped**, so the paid L4 validator and Full
+   crawl are **not re-billed**.
+
+Inconclusive results are deliberately *not* cached: a `Dead` verdict caused by a
+DNS/SMTP/API blip (rather than a real syntax failure) is re-checked on resume, so
+a network glitch never poisons the cache with a false negative.
+
+> Prefer **Async** mode for anything you might need to resume — its job handle is
+> what survives a refresh. (Same ephemeral-filesystem caveat as below: this state
+> survives a wifi drop, but not a host reboot on Streamlit Cloud.)
 
 ## Deployment
 History, the cross-session dedup index, and saved export copies are written to a

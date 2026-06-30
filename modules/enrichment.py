@@ -11,11 +11,13 @@ from __future__ import annotations
 from urllib.parse import urlparse
 
 
-def enrich_leads(client, leads: list[dict], mode: str = "basic", progress=None) -> list[dict]:
+def enrich_leads(client, leads: list[dict], mode: str = "basic", progress=None, cache=None) -> list[dict]:
     """Mutate and return `leads` with enriched email/social data.
 
     `client` is an `OutscraperClient`. `progress` is an optional callable
-    `progress(done, total)` for the Streamlit progress bar.
+    `progress(done, total)` for the Streamlit progress bar. `cache` (optional) is
+    a checkpoint.JsonCache of {domain: record}: domains already crawled are reused
+    so a resumed run never re-crawls — and never re-spends credits on — them.
     """
     if mode == "basic":
         return leads
@@ -24,7 +26,7 @@ def enrich_leads(client, leads: list[dict], mode: str = "basic", progress=None) 
     if not domains:
         return leads
 
-    contact_map = _fetch_contacts(client, domains, progress)
+    contact_map = _fetch_contacts(client, domains, progress, cache)
 
     for lead in leads:
         domain = _domain_of(lead.get("website"))
@@ -49,24 +51,49 @@ def enrich_leads(client, leads: list[dict], mode: str = "basic", progress=None) 
 
 # ───────────────────────── internals ─────────────────────────
 
-def _fetch_contacts(client, domains: list[str], progress) -> dict[str, dict]:
-    """Call Outscraper emails-and-contacts, batched, return {domain: record}."""
-    out: dict[str, dict] = {}
-    batch_size = 25
-    total = len(domains)
-    done = 0
+def _fetch_contacts(client, domains: list[str], progress, cache=None) -> dict[str, dict]:
+    """Call Outscraper emails-and-contacts, batched, return {domain: record}.
 
-    for start in range(0, total, batch_size):
-        batch = domains[start:start + batch_size]
+    Domains already in `cache` are served from it (no API call). Only batches that
+    actually return (no exception) are written to the cache, so a batch that failed
+    mid-network is retried — not remembered as "empty" — on the next run.
+    """
+    out: dict[str, dict] = {}
+    total = len(domains)
+
+    todo: list[str] = []
+    for d in domains:
+        if cache is not None and d in cache:
+            out[d] = cache.get(d)
+        else:
+            todo.append(d)
+
+    done = total - len(todo)
+    if progress:
+        progress(done, total)
+
+    batch_size = 25
+    for start in range(0, len(todo), batch_size):
+        batch = todo[start:start + batch_size]
+        ok = True
         try:
             results = client.emails_and_contacts(batch)
         except Exception:
-            results = []
+            results, ok = [], False
 
+        found: dict[str, dict] = {}
         for item in _flatten(results):
             domain = _domain_of(item.get("query") or item.get("domain"))
             if domain:
-                out[domain] = item
+                found[domain] = item
+
+        for d in batch:
+            record = found.get(d, {})
+            out[d] = record
+            if cache is not None and ok:        # cache only confirmed query outcomes
+                cache.put(d, record)
+        if cache is not None and ok:
+            cache.flush()
 
         done += len(batch)
         if progress:

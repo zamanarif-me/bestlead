@@ -11,9 +11,13 @@ Run from the project root:
 
 from __future__ import annotations
 
-from modules import dedup, enrichment, exporter, history, icebreaker, scoring
+import os
+
+import pytest
+
+from modules import checkpoint, dedup, enrichment, exporter, history, icebreaker, scoring
 from modules.scraper import normalize_lead
-from modules.validator import EmailValidator, _pick_best, classify_type
+from modules.validator import EmailValidator, _cacheable, _pick_best, classify_type
 
 
 # ───────────────── scraper.normalize_lead ─────────────────
@@ -181,3 +185,117 @@ def test_atomic_write_replaces_file(tmp_path):
     assert target.read_text(encoding="utf-8") == '{"k": "v"}'
     # No stray temp parts left behind.
     assert [p.name for p in tmp_path.iterdir()] == ["idx.json"]
+
+
+# ───────────────── checkpoint / resume ─────────────────
+
+@pytest.fixture
+def cp_tmp(tmp_path, monkeypatch):
+    """Redirect checkpoint storage into a tmp dir so tests don't touch ./data."""
+    monkeypatch.setattr(checkpoint, "JOBS_DIR", str(tmp_path / "jobs"))
+    monkeypatch.setattr(checkpoint, "CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(checkpoint, "ACTIVE_JOB", str(tmp_path / "jobs" / "active.json"))
+    return tmp_path
+
+
+def test_job_save_load_update_clear(cp_tmp):
+    assert checkpoint.load_job() is None
+    checkpoint.save_job({"job_id": "x", "stage": "submitted"})
+    assert checkpoint.load_job()["stage"] == "submitted"
+    checkpoint.update_job(stage="scraped", leads=[{"a": 1}])
+    job = checkpoint.load_job()
+    assert job["stage"] == "scraped" and job["leads"] == [{"a": 1}]
+    assert job["job_id"] == "x"                 # untouched fields survive a merge
+    checkpoint.clear_job()
+    assert checkpoint.load_job() is None
+
+
+def test_update_job_noop_without_active_job(cp_tmp):
+    assert checkpoint.update_job(stage="scraped") is None
+
+
+def test_jsoncache_throttles_then_persists(cp_tmp):
+    path = os.path.join(checkpoint.CACHE_DIR, "c.json")
+    c = checkpoint.JsonCache(path, flush_every=2)
+    c.put("a", 1)
+    assert not os.path.exists(path)             # below threshold, not yet written
+    c.put("b", 2)
+    assert os.path.exists(path)                  # threshold hit -> flushed
+    reloaded = checkpoint.JsonCache(path)
+    assert "a" in reloaded and reloaded.get("b") == 2
+
+
+def test_jsoncache_manual_flush(cp_tmp):
+    path = os.path.join(checkpoint.CACHE_DIR, "c.json")
+    c = checkpoint.JsonCache(path, flush_every=100)
+    c.put("a", 1)
+    c.flush()
+    assert checkpoint.JsonCache(path).get("a") == 1
+
+
+# ───────────────── resume caches skip already-done work ─────────────────
+
+class _FakeCache:
+    def __init__(self, seed=None):
+        self.d = dict(seed or {})
+        self.puts = []
+
+    def __contains__(self, k):
+        return k in self.d
+
+    def get(self, k, default=None):
+        return self.d.get(k, default)
+
+    def put(self, k, v):
+        self.d[k] = v
+        self.puts.append(k)
+
+    def flush(self):
+        pass
+
+
+def test_cacheable_filter():
+    assert _cacheable({"status": "Valid"})
+    assert _cacheable({"status": "Risky"})
+    assert _cacheable({"status": "Dead", "syntax": False})        # deterministic syntax fail
+    assert not _cacheable({"status": "Dead", "syntax": True})     # could be a net blip -> recheck
+    assert not _cacheable({"status": "Unknown"})
+
+
+def test_validator_skips_cached_emails(monkeypatch):
+    v = EmailValidator(levels=("syntax",))
+    calls = []
+    real = v.validate_email
+    monkeypatch.setattr(v, "validate_email", lambda e: calls.append(e) or real(e))
+
+    cache = _FakeCache(seed={"cached@a.com": {"email": "cached@a.com", "status": "Valid", "type": "Direct"}})
+    leads = [{"emails": ["cached@a.com", "new@a.com"]}]
+    v.validate_leads(leads, cache=cache)
+
+    assert calls == ["new@a.com"]                 # cached email was NOT re-validated (no re-charge)
+    assert "new@a.com" in cache.d                  # newly validated email is now cached
+    assert leads[0]["email_best"] == "cached@a.com"  # Valid beats the new Risky one
+
+
+def test_enrichment_skips_cached_domains():
+    cache = _FakeCache(seed={"a.com": {"emails": [{"value": "x@a.com"}], "facebook": "fb/a"}})
+
+    class FakeClient:
+        def __init__(self):
+            self.queried = []
+
+        def emails_and_contacts(self, domains):
+            self.queried += domains
+            return [[{"query": d, "email_1": f"new@{d}"} for d in domains]]
+
+    client = FakeClient()
+    leads = [
+        {"website": "http://a.com", "emails": [], "socials": {}},
+        {"website": "http://b.com", "emails": [], "socials": {}},
+    ]
+    enrichment.enrich_leads(client, leads, mode="full", cache=cache)
+
+    assert client.queried == ["b.com"]             # a.com served from cache, only b.com crawled
+    assert "x@a.com" in leads[0]["emails"]          # cached email merged in
+    assert leads[0]["socials"].get("facebook") == "fb/a"
+    assert "new@b.com" in leads[1]["emails"]        # freshly crawled email merged in

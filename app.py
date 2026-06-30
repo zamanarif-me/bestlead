@@ -9,12 +9,13 @@ Run:  streamlit run app.py
 from __future__ import annotations
 
 import os
+import time
 
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
-from modules import dedup, enrichment, exporter, history, icebreaker, scoring
+from modules import checkpoint, dedup, enrichment, exporter, history, icebreaker, scoring
 from modules.scraper import OutscraperClient, ScrapeConfig
 from modules.validator import EmailValidator
 
@@ -25,12 +26,39 @@ st.title("🎯 Best Lead")
 st.caption("Google Maps → enriched, validated, scored home-service leads → Instantly / Call-list CSV")
 
 
+def _secret(name: str, default: str = "") -> str:
+    """Read a config value, preferring Streamlit Cloud secrets, then .env.
+
+    On Streamlit Cloud, put the key under Settings → Secrets as:
+        OUTSCRAPER_API_KEY = "sk_..."
+    Locally, st.secrets is empty/absent, so we fall back to the .env value.
+    """
+    try:
+        if name in st.secrets:                  # raises if no secrets configured
+            return str(st.secrets[name])
+    except Exception:
+        pass
+    return os.getenv(name, default)
+
+
+def _fmt_elapsed(start: float | None) -> str:
+    if not start:
+        return ""
+    secs = int(time.time() - start)
+    mins, secs = divmod(secs, 60)
+    return f"{mins}m {secs:02d}s" if mins else f"{secs}s"
+
+
 # ─────────────────────────── Sidebar ───────────────────────────
 with st.sidebar:
     st.header("⚙️ Settings")
 
-    api_key = st.text_input("Outscraper API key", value=os.getenv("OUTSCRAPER_API_KEY", ""),
-                            type="password", help="Loaded from .env; override here if needed.")
+    _key_default = _secret("OUTSCRAPER_API_KEY", "")
+    api_key = st.text_input("Outscraper API key", value=_key_default,
+                            type="password",
+                            help="Auto-loaded from Streamlit Secrets or .env; override here if needed.")
+    if _key_default and _key_default != "your_api_key_here":
+        st.caption("🔑 Key loaded from secrets/.env.")
 
     run_mode = st.radio("Run mode", ["Sync", "Async"], horizontal=True,
                         help="Async is recommended for 500+ leads.")
@@ -65,23 +93,45 @@ def selected_levels() -> tuple[str, ...]:
 
 
 # ─────────────────────────── Pipeline ───────────────────────────
-def run_pipeline(client: OutscraperClient, leads: list[dict], meta: dict) -> list[dict]:
+def run_pipeline(client: OutscraperClient, leads: list[dict], meta: dict,
+                 enrich: str | None = None, levels: tuple[str, ...] | None = None) -> list[dict]:
+    """Enrich → validate → score → … → persist.
+
+    Checkpoint-backed: the scraped leads are saved to disk before any paid work,
+    and enrichment/validation consult on-disk caches. So if the network drops or
+    the app restarts mid-run, re-running this on the same leads skips everything
+    already done (no re-charging) instead of starting over. `enrich`/`levels` let
+    a resume reuse the ORIGINAL run's settings rather than the current sidebar.
+    """
     if not leads:
+        checkpoint.clear_job()
         return leads
 
-    if enrich_mode == "Full":
+    enrich = enrich or enrich_mode
+    levels = tuple(levels) if levels else selected_levels()
+
+    # Persist the raw scrape up front — this is the snapshot a resume falls back to.
+    checkpoint.update_job(stage="scraped", leads=leads, meta=meta,
+                          enrich_mode=enrich, levels=list(levels))
+
+    if enrich == "Full":
+        ecache = checkpoint.enrichment_cache()
         bar = st.progress(0.0, text="Enriching emails…")
-        enrichment.enrich_leads(client, leads, mode="full",
+        enrichment.enrich_leads(client, leads, mode="full", cache=ecache,
                                 progress=lambda d, t: bar.progress(d / max(t, 1), text=f"Enriching {d}/{t} domains"))
         bar.empty()
+        checkpoint.update_job(stage="enriched", leads=leads)
     else:
         enrichment.enrich_leads(client, leads, mode="basic")
 
-    validator = EmailValidator(client=client if lvl_api else None,
-                               levels=selected_levels(), smtp_from=os.getenv("SMTP_FROM_EMAIL"))
+    vcache = checkpoint.validation_cache()
+    validator = EmailValidator(client=client if "api" in levels else None,
+                               levels=levels, smtp_from=os.getenv("SMTP_FROM_EMAIL"))
     bar = st.progress(0.0, text="Validating emails…")
-    validator.validate_leads(leads, progress=lambda d, t: bar.progress(d / max(t, 1), text=f"Validating {d}/{t} emails"))
+    validator.validate_leads(leads, cache=vcache,
+                             progress=lambda d, t: bar.progress(d / max(t, 1), text=f"Validating {d}/{t} emails"))
     bar.empty()
+    checkpoint.update_job(stage="validated", leads=leads)
 
     scoring.score_leads(leads)
     icebreaker.add_icebreakers(leads)
@@ -89,6 +139,7 @@ def run_pipeline(client: OutscraperClient, leads: list[dict], meta: dict) -> lis
     history.flag_seen_before(leads)          # compare to PAST sessions
     session = history.save_session(leads, meta)   # persist + update index
     st.session_state["last_session"] = session
+    checkpoint.clear_job()                    # run fully complete — nothing to resume
     return leads
 
 
@@ -153,6 +204,11 @@ with tab_run:
                                drop_duplicates=drop_dupes_api, extract_contacts=False)
             meta = {"niche": niche, "locations": locations, "mode": enrich_mode, "run_mode": run_mode}
 
+            # Record the job up front so a drop during scraping can still resume.
+            checkpoint.save_job({"job_id": None, "stage": "submitted", "meta": meta,
+                                 "enrich_mode": enrich_mode, "levels": list(selected_levels()),
+                                 "run_mode": run_mode, "leads": None})
+
             if run_mode == "Sync":
                 with st.spinner(f"Scraping {len(locations)} location(s)…"):
                     leads = client.search_sync(cfg)
@@ -163,29 +219,94 @@ with tab_run:
                 request_id = client.search_async(cfg)
                 st.session_state["request_id"] = request_id
                 st.session_state["pending_meta"] = meta
+                st.session_state["job_started_at"] = time.time()
                 st.session_state.pop("leads", None)
+                checkpoint.update_job(job_id=request_id)   # persist handle for resume
                 st.info(f"Async job started. Job ID: `{request_id}`")
         except Exception as e:
             st.error(f"❌ {e}")
 
+    # ── Resume an interrupted run (wifi drop / refresh / app restart) ──
+    resume = checkpoint.load_job()
+    if resume and not st.session_state.get("leads") and not st.session_state.get("request_id"):
+        stage = resume.get("stage")
+        with st.container(border=True):
+            if stage == "submitted" and resume.get("job_id"):
+                st.warning("🔁 Unfinished job found — still scraping on Outscraper's side.")
+                st.code(resume["job_id"], language=None)
+                rc1, rc2 = st.columns(2)
+                if rc1.button("▶️ Resume this job", use_container_width=True):
+                    st.session_state["request_id"] = resume["job_id"]
+                    st.session_state["pending_meta"] = resume.get("meta", {})
+                    st.session_state["job_started_at"] = time.time()
+                    st.rerun()
+                if rc2.button("🗑️ Discard", use_container_width=True):
+                    checkpoint.clear_job()
+                    st.rerun()
+            elif resume.get("leads"):
+                n = len(resume["leads"])
+                st.warning(f"🔁 A previous run was interrupted at **{stage}** with **{n} leads**. "
+                           "Resume to finish — already-validated emails and crawled domains are "
+                           "skipped, so you're not re-charged.")
+                rc1, rc2 = st.columns(2)
+                if rc1.button("▶️ Resume processing", type="primary", use_container_width=True):
+                    try:
+                        client = OutscraperClient(api_key=api_key)
+                        leads = run_pipeline(client, resume["leads"], resume.get("meta", {}),
+                                             enrich=resume.get("enrich_mode"),
+                                             levels=tuple(resume.get("levels") or ()))
+                        st.session_state["leads"] = leads
+                        st.success(f"Done — {len(leads)} leads.")
+                    except Exception as e:
+                        st.error(f"❌ {e}")
+                if rc2.button("🗑️ Discard", use_container_width=True):
+                    checkpoint.clear_job()
+                    st.rerun()
+
     # Async job tracker
     if st.session_state.get("request_id") and "leads" not in st.session_state:
-        st.warning("⏳ Async job in progress.")
+        started = st.session_state.get("job_started_at")
+        elapsed = _fmt_elapsed(started)
+
+        # Live "it's working" sign: animated status + running clock.
+        st.status(f"⏳ Async job running{(' · ' + elapsed) if elapsed else ''}…",
+                  state="running", expanded=False)
         st.code(st.session_state["request_id"], language=None)
-        if st.button("🔄 Check job status"):
+
+        bcols = st.columns([1, 1])
+        check = bcols[0].button("🔄 Check job status", use_container_width=True)
+        auto = bcols[1].checkbox("🔁 Auto-refresh (10s)",
+                                 value=st.session_state.get("auto_poll", False),
+                                 help="Keeps checking on its own until the job finishes.")
+        st.session_state["auto_poll"] = auto
+
+        if check or auto:
             try:
                 client = OutscraperClient(api_key=api_key)
-                res = client.poll_async(st.session_state["request_id"])
+                with st.spinner("Checking Outscraper…"):
+                    res = client.poll_async(st.session_state["request_id"])
                 if res["status"] == "Success":
-                    leads = run_pipeline(client, res["leads"], st.session_state.get("pending_meta", {}))
+                    job = checkpoint.load_job() or {}   # use the run's ORIGINAL settings
+                    leads = run_pipeline(client, res["leads"], st.session_state.get("pending_meta", {}),
+                                         enrich=job.get("enrich_mode"),
+                                         levels=tuple(job.get("levels") or ()))
                     st.session_state["leads"] = leads
                     st.session_state.pop("request_id", None)
-                    st.success(f"Done — {len(leads)} leads.")
+                    st.session_state.pop("auto_poll", None)
+                    st.success(f"Done — {len(leads)} leads in {elapsed or 'a moment'}.")
                 elif res["status"] == "Error":
                     st.error("Outscraper reported an error for this job.")
                     st.session_state.pop("request_id", None)
+                    st.session_state.pop("auto_poll", None)
+                    checkpoint.clear_job()
                 else:
-                    st.info("Still pending… check again in a moment.")
+                    if auto:
+                        # Visible animated wait, then re-poll automatically.
+                        with st.spinner(f"Still working — re-checking in 10s (running {elapsed})…"):
+                            time.sleep(10)
+                        st.rerun()
+                    else:
+                        st.info("Still pending… click again, or enable Auto-refresh.")
             except Exception as e:
                 st.error(f"❌ {e}")
 
