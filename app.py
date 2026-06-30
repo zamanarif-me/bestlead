@@ -70,6 +70,11 @@ with st.sidebar:
     st.subheader("✉️ Email enrichment")
     enrich_mode = st.radio("Mode", ["Basic", "Full"], horizontal=True,
                            help="Basic = Maps emails only. Full = also crawl each domain (more emails + socials).")
+    strict_emails = st.checkbox(
+        "Only business-domain emails (strict)", value=True,
+        help="Keep emails whose domain matches the business website (plus gmail/yahoo "
+             "etc. that small businesses really use). Drops foreign/agency/junk emails "
+             "scraped from a site's footer or widgets — e.g. copyright@x.com.")
 
     st.subheader("🛡️ Dead-email detection")
     st.checkbox("L1 · Syntax", value=True, disabled=True)
@@ -94,7 +99,8 @@ def selected_levels() -> tuple[str, ...]:
 
 # ─────────────────────────── Pipeline ───────────────────────────
 def run_pipeline(client: OutscraperClient, leads: list[dict], meta: dict,
-                 enrich: str | None = None, levels: tuple[str, ...] | None = None) -> list[dict]:
+                 enrich: str | None = None, levels: tuple[str, ...] | None = None,
+                 strict: bool | None = None) -> list[dict]:
     """Enrich → validate → score → … → persist.
 
     Checkpoint-backed: the scraped leads are saved to disk before any paid work,
@@ -109,10 +115,11 @@ def run_pipeline(client: OutscraperClient, leads: list[dict], meta: dict,
 
     enrich = enrich or enrich_mode
     levels = tuple(levels) if levels else selected_levels()
+    strict = strict_emails if strict is None else strict
 
     # Persist the raw scrape up front — this is the snapshot a resume falls back to.
     checkpoint.update_job(stage="scraped", leads=leads, meta=meta,
-                          enrich_mode=enrich, levels=list(levels))
+                          enrich_mode=enrich, levels=list(levels), strict=strict)
 
     if enrich == "Full":
         ecache = checkpoint.enrichment_cache()
@@ -126,7 +133,8 @@ def run_pipeline(client: OutscraperClient, leads: list[dict], meta: dict,
 
     vcache = checkpoint.validation_cache()
     validator = EmailValidator(client=client if "api" in levels else None,
-                               levels=levels, smtp_from=os.getenv("SMTP_FROM_EMAIL"))
+                               levels=levels, smtp_from=os.getenv("SMTP_FROM_EMAIL"),
+                               strict_domain=strict)
     bar = st.progress(0.0, text="Validating emails…")
     validator.validate_leads(leads, cache=vcache,
                              progress=lambda d, t: bar.progress(d / max(t, 1), text=f"Validating {d}/{t} emails"))
@@ -175,7 +183,8 @@ def _label_icon(lead: dict) -> str:
 
 
 # ─────────────────────────── Tabs ───────────────────────────
-tab_run, tab_results, tab_export = st.tabs(["🚀 Run Scraper", "📊 Results", "💾 Export"])
+tab_run, tab_results, tab_export, tab_history = st.tabs(
+    ["🚀 Run Scraper", "📊 Results", "💾 Export", "🗂️ History"])
 
 # ---------- Tab 1: Run ----------
 with tab_run:
@@ -207,7 +216,7 @@ with tab_run:
             # Record the job up front so a drop during scraping can still resume.
             checkpoint.save_job({"job_id": None, "stage": "submitted", "meta": meta,
                                  "enrich_mode": enrich_mode, "levels": list(selected_levels()),
-                                 "run_mode": run_mode, "leads": None})
+                                 "strict": strict_emails, "run_mode": run_mode, "leads": None})
 
             if run_mode == "Sync":
                 with st.spinner(f"Scraping {len(locations)} location(s)…"):
@@ -254,7 +263,8 @@ with tab_run:
                         client = OutscraperClient(api_key=api_key)
                         leads = run_pipeline(client, resume["leads"], resume.get("meta", {}),
                                              enrich=resume.get("enrich_mode"),
-                                             levels=tuple(resume.get("levels") or ()))
+                                             levels=tuple(resume.get("levels") or ()),
+                                             strict=resume.get("strict"))
                         st.session_state["leads"] = leads
                         st.success(f"Done — {len(leads)} leads.")
                     except Exception as e:
@@ -289,7 +299,8 @@ with tab_run:
                     job = checkpoint.load_job() or {}   # use the run's ORIGINAL settings
                     leads = run_pipeline(client, res["leads"], st.session_state.get("pending_meta", {}),
                                          enrich=job.get("enrich_mode"),
-                                         levels=tuple(job.get("levels") or ()))
+                                         levels=tuple(job.get("levels") or ()),
+                                         strict=job.get("strict"))
                     st.session_state["leads"] = leads
                     st.session_state.pop("request_id", None)
                     st.session_state.pop("auto_poll", None)
@@ -384,37 +395,57 @@ with tab_export:
         st.info("Nothing to export yet.")
     else:
         st.subheader("⬇️ Download")
-        instantly = exporter.to_instantly_csv(leads)
-        calllist = exporter.to_call_list_csv(leads)
-        full = exporter.to_full_csv(leads)
+        chosen = st.multiselect(
+            "Include labels", ["Hot", "Warm", "Cold"], default=["Hot", "Warm", "Cold"],
+            help="Export only the lead temperatures you pick — e.g. just Hot + Warm.")
+        export_leads = [l for l in leads if l.get("lead_label") in chosen] if chosen else []
+        st.caption(f"{len(export_leads)} of {len(leads)} leads match the selected labels.")
+
+        instantly = exporter.to_instantly_csv(export_leads)
+        calllist = exporter.to_call_list_csv(export_leads)
+        full = exporter.to_full_csv(export_leads)
 
         d1, d2, d3 = st.columns(3)
         if d1.download_button("Instantly-ready CSV", instantly, file_name="instantly_leads.csv",
-                              mime="text/csv", use_container_width=True):
+                              mime="text/csv", use_container_width=True,
+                              disabled=not export_leads):
             history.save_export("instantly_leads.csv", instantly)
         if d2.download_button("Call list CSV", calllist, file_name="call_list.csv",
-                              mime="text/csv", use_container_width=True):
+                              mime="text/csv", use_container_width=True,
+                              disabled=not export_leads):
             history.save_export("call_list.csv", calllist)
         if d3.download_button("Full data CSV", full, file_name="all_leads.csv",
-                              mime="text/csv", use_container_width=True):
+                              mime="text/csv", use_container_width=True,
+                              disabled=not export_leads):
             history.save_export("all_leads.csv", full)
 
-    st.divider()
+
+# ---------- Tab 4: History ----------
+with tab_history:
     st.subheader("🗂️ Session history")
-    st.caption("⚠️ History & cross-session dedup live on local disk (./data). On "
-               "ephemeral hosts (Streamlit Cloud, most containers) this resets on "
-               "every restart — see README → Deployment for persistent storage.")
+    st.caption("Every run is saved here automatically. Download any past run's full "
+               "CSV, even after closing the app.")
+    st.caption("⚠️ Stored on local disk (./data). On ephemeral hosts (Streamlit Cloud, "
+               "most containers) this resets on restart — see README → Deployment for "
+               "persistent storage.")
+
     sessions = history.list_sessions()
     if not sessions:
-        st.caption("No past sessions yet.")
+        st.info("No past sessions yet — run the scraper and they'll appear here.")
     else:
+        st.caption(f"{len(sessions)} saved session(s).")
         for s in sessions:
             meta = s.get("meta", {})
-            line = f"**{s['session_id']}** · {s['modified']} · {s.get('rows', '?')} leads"
+            bits = [f"**{s['session_id']}**", s["modified"], f"{s.get('rows', '?')} leads"]
             if meta.get("niche"):
-                line += f" · _{meta['niche']}_"
-            cols = st.columns([4, 1])
-            cols[0].markdown(line)
+                bits.append(f"_{meta['niche']}_")
+            if meta.get("locations"):
+                locs = meta["locations"]
+                bits.append("📍 " + (", ".join(locs[:2]) + (f" +{len(locs) - 2}" if len(locs) > 2 else "")))
+            if meta.get("mode"):
+                bits.append(f"✉️ {meta['mode']}")
+            cols = st.columns([5, 1])
+            cols[0].markdown(" · ".join(bits))
             cols[1].download_button("⬇️ CSV", history.read_session_csv(s["path"]),
                                     file_name=f"{s['session_id']}.csv", mime="text/csv",
                                     key=f"dl_{s['session_id']}")

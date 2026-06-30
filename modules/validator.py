@@ -19,10 +19,24 @@ import os
 import re
 import smtplib
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse
 
 import dns.resolver
 
 _EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+
+# Domains that are never a business's real contact address — they get scraped out
+# of a site's footer links, embedded widgets, analytics, registrar/CDN, or social
+# buttons. Emails on these are always dropped (e.g. copyright@x.com, *@sentry.io).
+JUNK_EMAIL_DOMAINS = {
+    "x.com", "twitter.com", "facebook.com", "fb.com", "instagram.com",
+    "linkedin.com", "youtube.com", "pinterest.com", "tiktok.com", "wa.me",
+    "sentry.io", "sentry-next.wixpress.com", "wix.com", "wixpress.com",
+    "squarespace.com", "godaddy.com", "shopify.com", "cloudflare.com",
+    "google.com", "gstatic.com", "googleapis.com", "schema.org", "w3.org",
+    "example.com", "domain.com", "email.com", "sentry.wixpress.com",
+    "verizonwireless.com", "wordpress.com", "wordpress.org",
+}
 
 GENERIC_PREFIXES = {
     "info", "contact", "sales", "support", "admin", "hello", "office", "team",
@@ -42,12 +56,14 @@ class EmailValidator:
     """Stateful validator. Holds DNS/SMTP caches so repeated domains are cheap."""
 
     def __init__(self, client=None, levels: tuple[str, ...] = ("syntax", "mx"),
-                 smtp_from: str | None = None, max_workers: int = 8):
+                 smtp_from: str | None = None, max_workers: int = 8,
+                 strict_domain: bool = True):
         self.client = client                       # OutscraperClient (for API level)
         self.levels = set(levels)
         self.smtp_from = smtp_from or os.getenv("SMTP_FROM_EMAIL", "verify@example.com")
         self.smtp_helo = os.getenv("SMTP_FROM_DOMAIN", "example.com")
         self.max_workers = max_workers
+        self.strict_domain = strict_domain         # drop emails not matching the website
         self._mx_cache: dict[str, list[str]] = {}
 
     # ─────────────── public API ───────────────
@@ -61,6 +77,13 @@ class EmailValidator:
         Only confident results are cached (see `_cacheable`); a "Dead" caused by a
         DNS/SMTP/API blip is NOT cached, so it is safely re-checked on resume.
         """
+        # Drop junk/foreign emails up front (per lead, against its own website),
+        # BEFORE validating — so we never pay L4 credits to validate garbage.
+        for lead in leads:
+            site = _site_domain(lead.get("website"))
+            lead["emails"] = [e for e in (lead.get("emails") or [])
+                              if _trusted_email(e, site, self.strict_domain)]
+
         all_emails = sorted({e.lower() for lead in leads for e in lead.get("emails", [])})
 
         results: dict[str, dict] = {}
@@ -105,7 +128,7 @@ class EmailValidator:
         for lead in leads:
             details = [results[e.lower()] for e in lead.get("emails", []) if e.lower() in results]
             lead["email_details"] = details
-            best = _pick_best(details)
+            best = _pick_best(details, _site_domain(lead.get("website")))
             lead["email_best"] = best.get("email") if best else None
             lead["email_best_type"] = best.get("type") if best else None
             lead["email_status"] = best.get("status") if best else "No email"
@@ -235,8 +258,56 @@ def classify_type(email: str) -> str:
     return "Direct"
 
 
-def _pick_best(details: list[dict]) -> dict | None:
-    """Prefer deliverable Direct > Generic > anything; Dead emails last."""
+def _email_domain(email: str | None) -> str:
+    if not email or "@" not in email:
+        return ""
+    return email.rsplit("@", 1)[1].strip().lower()
+
+
+def _site_domain(website: str | None) -> str:
+    """Bare host of a business website, e.g. 'https://www.Acme.com/x' -> 'acme.com'."""
+    if not website:
+        return ""
+    url = website.strip()
+    if "://" not in url:
+        url = "http://" + url
+    host = urlparse(url).netloc.lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def _same_domain(email_dom: str, site_dom: str) -> bool:
+    """True if the email lives on the website's domain (or a sub/parent of it)."""
+    if not email_dom or not site_dom:
+        return False
+    return (email_dom == site_dom
+            or email_dom.endswith("." + site_dom)
+            or site_dom.endswith("." + email_dom))
+
+
+def _trusted_email(email: str | None, site_domain: str, strict: bool) -> bool:
+    """Decide whether an email is worth keeping.
+
+    Always drops known-junk domains (social/CDN/registrar footer scrapes). In
+    strict mode additionally keeps ONLY emails on the business's own domain or a
+    free provider (gmail/yahoo — small businesses really use those), dropping
+    foreign corporate emails accidentally scraped from the page.
+    """
+    dom = _email_domain(email)
+    if not dom or dom in JUNK_EMAIL_DOMAINS:
+        return False
+    if not strict:
+        return True
+    if dom in FREE_PROVIDERS:
+        return True
+    return _same_domain(dom, site_domain)
+
+
+def _pick_best(details: list[dict], site_domain: str | None = None) -> dict | None:
+    """Pick the best email: on-domain first, then deliverable, then Direct>Generic.
+
+    On-domain (matches the business website) is the strongest signal that the
+    address truly belongs to this business, so it outranks everything else.
+    """
     if not details:
         return None
 
@@ -244,6 +315,7 @@ def _pick_best(details: list[dict]) -> dict | None:
     status_rank = {"Valid": 3, "Risky": 2, "Unknown": 1, "Dead": 0}
 
     def key(d):
-        return (status_rank.get(d["status"], 0), type_rank.get(d["type"], 0))
+        on_domain = 1 if _same_domain(_email_domain(d.get("email")), site_domain or "") else 0
+        return (on_domain, status_rank.get(d["status"], 0), type_rank.get(d["type"], 0))
 
     return max(details, key=key)

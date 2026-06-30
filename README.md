@@ -64,6 +64,13 @@ requirements-dev.txt    # adds pytest
 - **Full enrichment** and the **API validator (L4)** consume Outscraper credits.
   Full enrichment is crawled **once** via `/emails-and-contacts` — the search is
   intentionally **not** also asked to enrich, which would double-bill the domains.
+- **Email trust filter** (`Only business-domain emails (strict)`, default on):
+  crawling a site picks up *any* email on the page — footer/widget/agency/social
+  junk like `copyright@x.com` or a foreign `kevin@otherco.net`. Strict mode keeps
+  only emails on the business's own domain **plus** free providers (gmail/yahoo,
+  which small businesses really use), and a junk-domain blocklist is dropped in
+  either mode. Filtering happens **before** L4, so you don't pay to validate junk.
+  The "best email" picker also prefers an on-domain address over an off-domain one.
 - Lead-scoring weights live in `modules/scoring.py → DEFAULT_WEIGHTS`.
 - **Run mode:** internally even "Sync" submits the job to Outscraper as a
   background request and polls for the result, so heavy jobs (Full enrichment,

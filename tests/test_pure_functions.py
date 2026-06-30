@@ -17,7 +17,9 @@ import pytest
 
 from modules import checkpoint, dedup, enrichment, exporter, history, icebreaker, scoring
 from modules.scraper import normalize_lead
-from modules.validator import EmailValidator, _cacheable, _pick_best, classify_type
+from modules.validator import (
+    EmailValidator, _cacheable, _pick_best, _site_domain, _trusted_email, classify_type,
+)
 
 
 # ───────────────── scraper.normalize_lead ─────────────────
@@ -110,6 +112,56 @@ def test_pick_best_prefers_valid_direct_over_risky_generic():
     ]
     assert _pick_best(details)["email"] == "jo@a.com"
     assert _pick_best([]) is None
+
+
+def test_pick_best_prefers_on_domain_email():
+    # An on-domain Risky email beats an off-domain Valid one — domain match is
+    # the strongest signal the address truly belongs to the business.
+    details = [
+        {"email": "kevin@swiftplumbing.net", "status": "Valid", "type": "Direct"},
+        {"email": "info@reliantplumbing.com", "status": "Risky", "type": "Generic"},
+    ]
+    assert _pick_best(details, "reliantplumbing.com")["email"] == "info@reliantplumbing.com"
+
+
+# ───────────────── email-trust filtering (junk / foreign drop) ─────────────────
+
+def test_site_domain_extraction():
+    assert _site_domain("https://www.ReliantPlumbing.com/austin") == "reliantplumbing.com"
+    assert _site_domain("bluedragonplumbing.com") == "bluedragonplumbing.com"
+    assert _site_domain(None) == ""
+
+
+def test_trusted_email_drops_junk_always():
+    # Junk domains dropped regardless of strict mode.
+    assert not _trusted_email("copyright@x.com", "brettandsons.com", strict=True)
+    assert not _trusted_email("copyright@x.com", "brettandsons.com", strict=False)
+    assert not _trusted_email("a@sentry.io", "acme.com", strict=False)
+
+
+def test_trusted_email_strict_rules():
+    site = "reliantplumbing.com"
+    assert _trusted_email("info@reliantplumbing.com", site, strict=True)       # on-domain -> keep
+    assert _trusted_email("abeltoplumb@gmail.com", site, strict=True)          # free provider -> keep
+    assert not _trusted_email("kevin@swiftplumbing.net", site, strict=True)    # foreign corp -> drop
+    assert not _trusted_email("x@verizonwireless.com", site, strict=True)      # junk -> drop
+
+
+def test_trusted_email_non_strict_keeps_foreign():
+    # Non-strict keeps foreign corporate emails (only junk is dropped).
+    assert _trusted_email("kevin@swiftplumbing.net", "reliantplumbing.com", strict=False)
+
+
+def test_validate_leads_strict_filters_emails():
+    v = EmailValidator(levels=("syntax",), strict_domain=True)
+    leads = [{
+        "website": "https://www.reliantplumbing.com/",
+        "emails": ["info@reliantplumbing.com", "kevin@swiftplumbing.net", "copyright@x.com"],
+    }]
+    v.validate_leads(leads)
+    # Only the on-domain email survives; foreign + junk are gone.
+    assert leads[0]["emails"] == ["info@reliantplumbing.com"]
+    assert leads[0]["email_best"] == "info@reliantplumbing.com"
 
 
 # ───────────────── scoring ─────────────────
@@ -263,7 +315,7 @@ def test_cacheable_filter():
 
 
 def test_validator_skips_cached_emails(monkeypatch):
-    v = EmailValidator(levels=("syntax",))
+    v = EmailValidator(levels=("syntax",), strict_domain=False)  # not testing domain filter here
     calls = []
     real = v.validate_email
     monkeypatch.setattr(v, "validate_email", lambda e: calls.append(e) or real(e))
